@@ -15,13 +15,17 @@ SOURCES = nccl_pipeline.cu
 # Common values: sm_70 (V100), sm_80 (A100), sm_86 (RTX 30xx), sm_89 (RTX 40xx)
 CUDA_ARCH = sm_80
 
+# MPI paths (auto-detect or use default)
+MPI_INCLUDE ?= /usr/lib/x86_64-linux-gnu/openmpi/include
+MPI_LIB ?= /usr/lib/x86_64-linux-gnu/openmpi/lib
+
 # Include paths
 INCLUDES = -I/usr/local/cuda/include \
-           -I$(MPI_HOME)/include
+           -I$(MPI_INCLUDE)
 
 # Library paths
 LIB_PATHS = -L/usr/local/cuda/lib64 \
-            -L$(MPI_HOME)/lib
+            -L$(MPI_LIB)
 
 # Libraries to link
 LIBS = -lnccl \
