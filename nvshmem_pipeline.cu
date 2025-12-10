@@ -324,9 +324,6 @@ int main(int argc, char **argv) {
     } else {
       // === GPU 1: Receive, Compute (like NCCL) ===
 
-      // Wait for data to arrive from PE 0
-      nvshmem_barrier_all();
-
       // Verify received data
       float norm = compute_norm(intermediate, BATCH_SIZE * D_HIDDEN, my_pe);
       printf("[Rank 1] Iter %d: Received activations shape [%d, %d], "
