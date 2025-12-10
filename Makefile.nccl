@@ -1,0 +1,78 @@
+# =============================================================================
+# Makefile for NCCL Pipeline C++ Implementation
+# =============================================================================
+
+# Compiler
+NVCC = nvcc
+
+# Target executable
+TARGET = nccl_pipeline
+
+# Source files
+SOURCES = nccl_pipeline.cu
+
+# CUDA architecture (adjust based on your GPU)
+# Common values: sm_70 (V100), sm_80 (A100), sm_86 (RTX 30xx), sm_89 (RTX 40xx)
+CUDA_ARCH = sm_80
+
+# Include paths
+INCLUDES = -I/usr/local/cuda/include \
+           -I$(MPI_HOME)/include
+
+# Library paths
+LIB_PATHS = -L/usr/local/cuda/lib64 \
+            -L$(MPI_HOME)/lib
+
+# Libraries to link
+LIBS = -lnccl \
+       -lcudart \
+       -lcublas \
+       -lcurand \
+       -lmpi
+
+# Compiler flags
+NVCC_FLAGS = -arch=$(CUDA_ARCH) \
+             -O3 \
+             -std=c++14 \
+             -Xcompiler -fopenmp
+
+# =============================================================================
+# Build Rules
+# =============================================================================
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCES)
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) $(LIB_PATHS) $< -o $@ $(LIBS)
+	@echo "✓ Build successful: $(TARGET)"
+	@echo "  Run with: mpirun -np 2 ./$(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+	@echo "✓ Cleaned build artifacts"
+
+# Run with 2 GPUs
+run: $(TARGET)
+	mpirun -np 2 ./$(TARGET)
+
+# Help
+help:
+	@echo "NCCL Pipeline Makefile"
+	@echo "======================"
+	@echo ""
+	@echo "Targets:"
+	@echo "  make           - Build the executable"
+	@echo "  make run       - Build and run with 2 GPUs"
+	@echo "  make clean     - Remove build artifacts"
+	@echo "  make help      - Show this help message"
+	@echo ""
+	@echo "Requirements:"
+	@echo "  - CUDA Toolkit (with NCCL)"
+	@echo "  - MPI (OpenMPI or MPICH)"
+	@echo "  - 2 NVIDIA GPUs"
+	@echo ""
+	@echo "Environment Variables (if needed):"
+	@echo "  MPI_HOME       - Path to MPI installation"
+	@echo "  CUDA_ARCH      - CUDA architecture (default: sm_80 for A100)"
+
+.PHONY: all clean run help

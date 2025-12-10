@@ -1,8 +1,8 @@
 /*
- * NVSHMEM Pipeline Parallelism Demo
+ * NCCL Pipeline Parallelism Demo
  *
- * Equivalent to NCLL.py but using NVSHMEM for GPU-to-GPU communication.
- * Implements a 2-GPU pipeline with same architecture:
+ * CUDA implementation matching NCLL.py behavior using NCCL for GPU-to-GPU
+ * communication. Implements a 2-GPU pipeline with same architecture:
  * - GPU 0: Linear(2048 -> 1024) + ReLU
  * - GPU 1: Linear(1024 -> 10) + ReLU
  */
@@ -10,8 +10,8 @@
 #include <assert.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include <nvshmem.h>
-#include <nvshmemx.h>
+#include <mpi.h>
+#include <nccl.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -34,21 +34,31 @@
     }                                                                          \
   } while (0)
 
-#define NVSHMEM_CHECK(call)                                                    \
+#define NCCL_CHECK(call)                                                       \
+  do {                                                                         \
+    ncclResult_t err = call;                                                   \
+    if (err != ncclSuccess) {                                                  \
+      fprintf(stderr, "NCCL error at %s:%d: %s\n", __FILE__, __LINE__,         \
+              ncclGetErrorString(err));                                        \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+#define MPI_CHECK(call)                                                        \
   do {                                                                         \
     int err = call;                                                            \
-    if (err != 0) {                                                            \
-      fprintf(stderr, "NVSHMEM error at %s:%d: code %d\n", __FILE__, __LINE__, \
+    if (err != MPI_SUCCESS) {                                                  \
+      fprintf(stderr, "MPI error at %s:%d: code %d\n", __FILE__, __LINE__,     \
               err);                                                            \
       exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
 // =============================================================================
-// CUDA Kernels
+// CUDA Kernels (Same as NVSHMEM version)
 // =============================================================================
 
-// Initialize weights with fixed seed (like PyTorch's Kaiming Uniform)
+// Initialize weights with fixed seed
 __global__ void init_weights_kernel(float *weights, int size,
                                     unsigned long seed) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -217,20 +227,19 @@ float compute_norm(const float *data, int size, int gpu_id) {
 // =============================================================================
 
 int main(int argc, char **argv) {
-  // Initialize NVSHMEM
-  nvshmemx_init_attr_t attr;
-  attr.mpi_comm = NULL;
-  nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+  // Initialize MPI
+  MPI_CHECK(MPI_Init(&argc, &argv));
 
-  int my_pe = nvshmem_my_pe();
-  int n_pes = nvshmem_n_pes();
+  int rank, world_size;
+  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+  MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &world_size));
 
-  if (n_pes != 2) {
-    if (my_pe == 0) {
-      fprintf(stderr, "This program requires exactly 2 PEs (GPUs), got %d\n",
-              n_pes);
+  if (world_size != 2) {
+    if (rank == 0) {
+      fprintf(stderr, "This program requires exactly 2 processes, got %d\n",
+              world_size);
     }
-    nvshmem_finalize();
+    MPI_Finalize();
     return 1;
   }
 
@@ -238,17 +247,17 @@ int main(int argc, char **argv) {
   int num_devices;
   CUDA_CHECK(cudaGetDeviceCount(&num_devices));
   if (num_devices < 2) {
-    if (my_pe == 0) {
+    if (rank == 0) {
       fprintf(stderr, "This program requires 2 GPUs, found %d\n", num_devices);
     }
-    nvshmem_finalize();
+    MPI_Finalize();
     return 1;
   }
 
-  CUDA_CHECK(cudaSetDevice(my_pe));
+  CUDA_CHECK(cudaSetDevice(rank));
 
-  if (my_pe == 0) {
-    printf("✓ Found %d GPUs. Starting NVSHMEM pipeline on 2 GPUs...\n",
+  if (rank == 0) {
+    printf("✓ Found %d GPUs. Starting NCCL pipeline on 2 GPUs...\n",
            num_devices);
     cudaDeviceProp prop;
     for (int i = 0; i < 2; i++) {
@@ -258,46 +267,57 @@ int main(int argc, char **argv) {
     printf("============================================================\n\n");
   }
 
-  printf("[Rank %d] NVSHMEM initialized on GPU %d\n", my_pe, my_pe);
+  // Initialize NCCL
+  ncclUniqueId nccl_id;
+  ncclComm_t nccl_comm;
+
+  // Rank 0 generates unique ID and broadcasts to all ranks
+  if (rank == 0) {
+    NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+  }
+  MPI_CHECK(
+      MPI_Bcast(&nccl_id, sizeof(ncclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD));
+
+  // Each rank initializes NCCL communicator
+  NCCL_CHECK(ncclCommInitRank(&nccl_comm, world_size, nccl_id, rank));
+  printf("[Rank %d] NCCL initialized on GPU %d\n", rank, rank);
 
   // Create pipeline stages
   PipelineStage stage;
-  if (my_pe == 0) {
-    init_stage(&stage, D_IN, D_HIDDEN, my_pe);
+  if (rank == 0) {
+    init_stage(&stage, D_IN, D_HIDDEN, rank);
   } else {
-    init_stage(&stage, D_HIDDEN, D_OUT, my_pe);
+    init_stage(&stage, D_HIDDEN, D_OUT, rank);
   }
 
   // Allocate buffers
   float *input = NULL;
   float *output = NULL;
-  float *intermediate = NULL; // NVSHMEM symmetric memory for full batch
+  float *intermediate = NULL;
 
-  if (my_pe == 0) {
+  if (rank == 0) {
     CUDA_CHECK(cudaMalloc(&input, BATCH_SIZE * D_IN * sizeof(float)));
-    // Allocate symmetric buffer for full batch (no micro-batching)
-    intermediate =
-        (float *)nvshmem_malloc(BATCH_SIZE * D_HIDDEN * sizeof(float));
+    CUDA_CHECK(
+        cudaMalloc(&intermediate, BATCH_SIZE * D_HIDDEN * sizeof(float)));
   } else {
-    // GPU 1 allocates same-sized symmetric buffer
-    intermediate =
-        (float *)nvshmem_malloc(BATCH_SIZE * D_HIDDEN * sizeof(float));
+    CUDA_CHECK(
+        cudaMalloc(&intermediate, BATCH_SIZE * D_HIDDEN * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&output, BATCH_SIZE * D_OUT * sizeof(float)));
   }
 
-  nvshmem_barrier_all();
+  // Synchronize before timing
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   // Pipeline execution
   cudaEvent_t start, stop;
-
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
 
   CUDA_CHECK(cudaEventRecord(start));
 
   for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
-    if (my_pe == 0) {
-      // === GPU 0: Generate, Compute, Send (like NCCL) ===
+    if (rank == 0) {
+      // === GPU 0: Generate, Compute, Send ===
 
       // Generate random input for entire batch
       int size = BATCH_SIZE * D_IN;
@@ -306,37 +326,39 @@ int main(int argc, char **argv) {
       generate_input_kernel<<<blocks, threads>>>(input, size, SEED, iter);
       CUDA_CHECK(cudaDeviceSynchronize());
 
-      // Forward pass through first stage (full batch)
+      // Forward pass through first stage
       forward_stage(&stage, input, intermediate, BATCH_SIZE);
 
       // Compute norm for validation
-      float norm = compute_norm(intermediate, BATCH_SIZE * D_HIDDEN, my_pe);
+      float norm = compute_norm(intermediate, BATCH_SIZE * D_HIDDEN, rank);
       printf("[Rank 0] Iter %d: Sent activations shape [%d, %d], norm=%.4f\n",
              iter, BATCH_SIZE, D_HIDDEN, norm);
 
-      // NVSHMEM: Send to PE 1 (blocking via quiet)
-      nvshmem_float_put_nbi(intermediate,          // dest on PE 1
-                            intermediate,          // source on PE 0
-                            BATCH_SIZE * D_HIDDEN, // full batch size
-                            1);                    // target PE
-      nvshmem_quiet(); // Wait for transfer to complete
+      // NCCL: Send to rank 1
+      // ncclSend is non-blocking, enqueued on CUDA stream
+      NCCL_CHECK(ncclSend(intermediate, BATCH_SIZE * D_HIDDEN, ncclFloat, 1,
+                          nccl_comm, 0));
+      CUDA_CHECK(cudaDeviceSynchronize()); // Wait for send to complete
 
     } else {
-      // === GPU 1: Receive, Compute (like NCCL) ===
+      // === GPU 1: Receive, Compute ===
 
-      // Wait for data to arrive from PE 0
-      nvshmem_barrier_all();
+      // NCCL: Receive from rank 0
+      // ncclRecv is non-blocking, enqueued on CUDA stream
+      NCCL_CHECK(ncclRecv(intermediate, BATCH_SIZE * D_HIDDEN, ncclFloat, 0,
+                          nccl_comm, 0));
+      CUDA_CHECK(cudaDeviceSynchronize()); // Wait for receive to complete
 
       // Verify received data
-      float norm = compute_norm(intermediate, BATCH_SIZE * D_HIDDEN, my_pe);
+      float norm = compute_norm(intermediate, BATCH_SIZE * D_HIDDEN, rank);
       printf("[Rank 1] Iter %d: Received activations shape [%d, %d], "
              "norm=%.4f\n",
              iter, BATCH_SIZE, D_HIDDEN, norm);
 
-      // Forward pass through second stage (full batch)
+      // Forward pass through second stage
       forward_stage(&stage, intermediate, output, BATCH_SIZE);
 
-      float out_norm = compute_norm(output, BATCH_SIZE * D_OUT, my_pe);
+      float out_norm = compute_norm(output, BATCH_SIZE * D_OUT, rank);
       printf("[Rank 1] Iter %d: Final output shape [%d, %d], norm=%.4f\n", iter,
              BATCH_SIZE, D_OUT, out_norm);
 
@@ -358,8 +380,8 @@ int main(int argc, char **argv) {
       }
     }
 
-    // Synchronize both PEs before next iteration
-    nvshmem_barrier_all();
+    // Synchronize both ranks before next iteration
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   }
 
   CUDA_CHECK(cudaEventRecord(stop));
@@ -368,27 +390,30 @@ int main(int argc, char **argv) {
   float milliseconds = 0;
   CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
 
-  if (my_pe == 0) {
+  if (rank == 0) {
     printf("\n============================================================\n");
-    printf("[NVSHMEM Pipeline] Completed %d iterations\n", NUM_ITERATIONS);
-    printf("[NVSHMEM Pipeline] Total time: %.4fs\n", milliseconds / 1000.0f);
-    printf("[NVSHMEM Pipeline] Avg time per iteration: %.4fs\n",
+    printf("[NCCL Pipeline] Completed %d iterations\n", NUM_ITERATIONS);
+    printf("[NCCL Pipeline] Total time: %.4fs\n", milliseconds / 1000.0f);
+    printf("[NCCL Pipeline] Avg time per iteration: %.4fs\n",
            milliseconds / 1000.0f / NUM_ITERATIONS);
     printf("============================================================\n");
   }
 
   // Cleanup
-  if (my_pe == 0) {
+  if (rank == 0) {
     CUDA_CHECK(cudaFree(input));
   } else {
     CUDA_CHECK(cudaFree(output));
   }
-  nvshmem_free(intermediate);
+  CUDA_CHECK(cudaFree(intermediate));
   CUDA_CHECK(cudaFree(stage.weight));
   CUDA_CHECK(cudaFree(stage.bias));
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
 
-  nvshmem_finalize();
+  // Finalize NCCL and MPI
+  NCCL_CHECK(ncclCommDestroy(nccl_comm));
+  MPI_CHECK(MPI_Finalize());
+
   return 0;
 }
