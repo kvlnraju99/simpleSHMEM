@@ -1,0 +1,10 @@
+# PyTorch with CUDA support for NCCL
+# Install the version compatible with your CUDA version
+# For CUDA 11.8:
+torch>=2.0.0
+
+# For CUDA 12.1, use:
+# torch>=2.1.0
+
+# Note: NCCL comes bundled with PyTorch CUDA installation
+# No separate NCCL package needed
